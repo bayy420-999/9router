@@ -77,7 +77,7 @@ describe("Codex SSE peek first-chunk timeout", () => {
     };
 
     const startedAt = Date.now();
-    const peek = executor._peekSseTransientError(response);
+    const peek = executor._peekSseTransientError(response, 60);
 
     await expect(peek).rejects.toMatchObject({
       name: "CodexPeekTimeoutError",
@@ -88,13 +88,83 @@ describe("Codex SSE peek first-chunk timeout", () => {
     expect(Date.now() - startedAt).toBeLessThan(2000);
   });
 
-  it("retries the transport failure then rejects, without leaking an unhandled rejection", async () => {
+  it("fails fast on a zero budget without acquiring a reader", async () => {
+    // A retry with no remaining budget must not open a reader at all.
     const executor = new CodexExecutor();
-    // Default budget is DEFAULT_RETRY_CONFIG[502] = 3 retries / 3000ms. Shrink it
-    // for the test (the real values are asserted in codex-500-retry.test.js);
-    // the retry *path* is what matters here.
+    const body = new ReadableStream({
+      start() { /* silent */ },
+    });
+    const response = { ok: true, status: 200, headers: new Map(), body };
+
+    const startedAt = Date.now();
+    await expect(executor._peekSseTransientError(response, 0)).rejects.toMatchObject({
+      codexPeekTimeout: true,
+    });
+    expect(Date.now() - startedAt).toBeLessThan(100);
+
+    // No reader was handed out, so the stream was never locked.
+    expect(body.locked).toBe(false);
+  });
+
+  it("retries a transport read failure while budget remains, without leaking an unhandled rejection", async () => {
+    const executor = new CodexExecutor();
+    // Default budget is DEFAULT_RETRY_CONFIG[502] = 3 retries / 3000ms. Shrink the
+    // retry *count* for speed (real values asserted in codex-500-retry.test.js);
+    // the peek budget (60ms, shared) still leaves room for a second attempt
+    // because attempt 1 fails immediately instead of burning the window.
     executor.config = { ...executor.config, retry: { 502: { attempts: 1, delayMs: 0 } } };
 
+    const fetchSpy = vi
+      .spyOn(proxyFetchModule, "proxyAwareFetch")
+      .mockImplementationOnce(async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Map(),
+        // Upstream tears the socket down mid-peek (the H2 case: this used to be
+        // swallowed, leaving a replacementBody over a dead upstream).
+        body: new ReadableStream({
+          start(controller) { controller.error(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" })); },
+        }),
+      }))
+      .mockImplementationOnce(async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Map(),
+        body: frameBody(OUTPUT_FRAME),
+      }));
+
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    let result;
+    try {
+      result = await executor.execute(executeArgs());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    // 1 initial attempt + 1 retry, and the retry's stream is handed back intact.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.response.status).toBe(200);
+    await expect(result.response.text()).resolves.toBe(OUTPUT_FRAME);
+    expect(unhandled).toEqual([]);
+  });
+
+  it("shares ONE peek budget across all retries instead of N × the timeout", async () => {
+    // Regression guard for the production-masking bug: per-attempt budgeting made
+    // the worst case (retries + 1) × STREAM_FIRST_CHUNK_TIMEOUT_MS ≈ 4 × 200s,
+    // which is longer than a typical edge/proxy idle timeout — so the fix would
+    // never fire before the proxy killed the socket.
+    const executor = new CodexExecutor();
+    // Generous retry budget so the *only* thing that can stop the loop is the
+    // total peek deadline, not retry exhaustion.
+    executor.config = { ...executor.config, retry: { 502: { attempts: 5, delayMs: 0 } } };
+
+    const remaining = [];
     const fetchSpy = vi
       .spyOn(proxyFetchModule, "proxyAwareFetch")
       .mockImplementation(async () => ({
@@ -105,24 +175,32 @@ describe("Codex SSE peek first-chunk timeout", () => {
         body: silentBody(),
       }));
 
-    const unhandled = [];
-    const onUnhandled = (reason) => unhandled.push(reason);
-    process.on("unhandledRejection", onUnhandled);
-
-    try {
-      await expect(executor.execute(executeArgs())).rejects.toMatchObject({
-        codexPeekTimeout: true,
+    // Record the budget each attempt was handed, then run the real peek.
+    const realPeek = CodexExecutor.prototype._peekSseTransientError;
+    const peekSpy = vi
+      .spyOn(executor, "_peekSseTransientError")
+      .mockImplementation(async (response, timeoutMs) => {
+        remaining.push(timeoutMs);
+        return realPeek.call(executor, response, timeoutMs);
       });
-      // The raced reader.read() settles after the deadline wins; it must be
-      // marked handled (readPromise.catch(() => {})) or it surfaces here.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    } finally {
-      process.off("unhandledRejection", onUnhandled);
-    }
 
-    // 1 initial attempt + 1 retry from the shrunken 502 budget.
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    expect(unhandled).toEqual([]);
+    const startedAt = Date.now();
+    await expect(executor.execute(executeArgs())).rejects.toMatchObject({
+      codexPeekTimeout: true,
+    });
+    const elapsed = Date.now() - startedAt;
+
+    expect(fetchSpy.mock.calls.length).toBeGreaterThan(1); // it did retry
+    expect(peekSpy).toHaveBeenCalled();
+    // Total wall clock stays inside ~one timeout window (60ms here), not N × 60ms
+    // with an unbounded number of retries.
+    expect(elapsed).toBeLessThan(60 * 3);
+    // The budget handed to later attempts is strictly smaller than the first —
+    // i.e. it is a shared deadline, not a fresh window per attempt.
+    expect(remaining[0]).toBeLessThanOrEqual(60);
+    if (remaining.length > 1) {
+      expect(remaining[remaining.length - 1]).toBeLessThan(remaining[0]);
+    }
   });
 
   it("leaves the normal SSE path untouched and clears the peek deadline", async () => {
@@ -137,7 +215,7 @@ describe("Codex SSE peek first-chunk timeout", () => {
     vi.useFakeTimers();
     let peek;
     try {
-      peek = await executor._peekSseTransientError(response);
+      peek = await executor._peekSseTransientError(response, 200000);
       // Timer hygiene: the deadline must not survive the successful exit (a
       // dangling 200s timer would keep the event loop / request context alive).
       expect(vi.getTimerCount()).toBe(0);
@@ -163,7 +241,7 @@ describe("Codex SSE peek first-chunk timeout", () => {
       ].join("\n")),
     };
 
-    const peek = await executor._peekSseTransientError(response);
+    const peek = await executor._peekSseTransientError(response, 200000);
     expect(peek.accountFallback).toBe(true);
     expect(peek.matched).toBeTruthy();
   });

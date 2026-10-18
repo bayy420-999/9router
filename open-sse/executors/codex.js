@@ -313,15 +313,31 @@ export class CodexExecutor extends BaseExecutor {
       attempts: peekTimeoutAttempts,
       delayMs: peekTimeoutDelayMs,
     } = resolveRetryEntry(retryConfig[HTTP_STATUS.BAD_GATEWAY]);
+    // The peek budget is TOTAL for the whole retry loop, not per attempt.
+    // Per-attempt budgeting made the worst case N × STREAM_FIRST_CHUNK_TIMEOUT_MS
+    // (4 × 200s + delays ≈ 600s), which is longer than a typical edge/proxy idle
+    // timeout — the fix would be masked in production by the very timeout it is
+    // meant to beat. Each attempt only gets what is left of the window.
+    const peekDeadlineAt = Date.now() + STREAM_FIRST_CHUNK_TIMEOUT_MS;
     let attempt = 0;
     let peekTimeoutAttempt = 0;
     while (true) {
       const result = await super.execute(args);
       let peek;
       try {
-        peek = await this._peekSseTransientError(result.response);
+        peek = await this._peekSseTransientError(
+          result.response,
+          Math.max(0, peekDeadlineAt - Date.now()),
+        );
       } catch (e) {
         if (!e?.codexPeekTimeout && !e?.codexPeekAborted) throw e;
+        // Out of budget: surface 502 now instead of looping over retries that
+        // have no time left to read anything.
+        if (Date.now() >= peekDeadlineAt) {
+          args.log?.warn?.("RETRY", `CODEX | ${e.message} — peek budget exhausted → 502`);
+          dbg("CODEX", `peek budget exhausted (${STREAM_FIRST_CHUNK_TIMEOUT_MS}ms) after ${peekTimeoutAttempt} retries → 502`);
+          throw e;
+        }
         if (peekTimeoutAttempt >= peekTimeoutAttempts) {
           args.log?.warn?.("RETRY", `CODEX | ${e.message} — retries exhausted (${peekTimeoutAttempt}/${peekTimeoutAttempts})`);
           dbg("CODEX", `peek transport failure exhausted after ${peekTimeoutAttempt} retries → 502`);
@@ -364,21 +380,24 @@ export class CodexExecutor extends BaseExecutor {
   // Peek first N bytes of SSE body to detect upstream transient errors.
   // Returns { matched: string|null, message: string|null, accountFallback: boolean, replacementBody: ReadableStream|null }.
   // Caller must use replacementBody when no error matched (original body has been read).
-  // The whole peek is bounded by STREAM_FIRST_CHUNK_TIMEOUT_MS: upstream can accept
-  // the request (headers arrive) and then go silent during reasoning prefill, and
-  // nothing else covers that window — FETCH_CONNECT_TIMEOUT_MS is already cleared
-  // and the stall watchdog is only armed after this returns. On timeout the reader
-  // is cancelled and a CodexPeekTimeoutError is thrown so the caller retries /
-  // surfaces 502 instead of piping a dead body downstream.
-  async _peekSseTransientError(response) {
+  // The peek is bounded by the caller's remaining STREAM_FIRST_CHUNK_TIMEOUT_MS
+  // budget: upstream can accept the request (headers arrive) and then go silent
+  // during reasoning prefill, and nothing else covers that window —
+  // FETCH_CONNECT_TIMEOUT_MS is already cleared and the stall watchdog is only
+  // armed after this returns. On timeout the reader is cancelled and a
+  // CodexPeekTimeoutError is thrown so the caller retries / surfaces 502 instead
+  // of piping a dead body downstream.
+  async _peekSseTransientError(response, timeoutMs = STREAM_FIRST_CHUNK_TIMEOUT_MS) {
     if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, replacementBody: null };
+    const peekTimeoutMs = timeoutMs;
+    // Retry with no budget left: fail fast, before acquiring a reader.
+    if (!(peekTimeoutMs > 0)) throw codexPeekTimeoutError(STREAM_FIRST_CHUNK_TIMEOUT_MS);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const chunks = [];
     let text = "";
     let matched = null;
     let accountFallback = false;
-    const peekTimeoutMs = STREAM_FIRST_CHUNK_TIMEOUT_MS;
     let peekTimer = null;
     let timedOut = false;
     const deadline = new Promise((_, reject) => {

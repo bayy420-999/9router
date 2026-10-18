@@ -69,6 +69,10 @@ export const ERROR_RULES = [
   { text: "overloaded",               backoff: true },
 
   // --- Status-based rules (fallback when text doesn't match) ---
+  // A 500 is an upstream-side fault, not a credential fault: keep the account
+  // cooldown short so one transient 500 doesn't lock a sole account for the
+  // 30s TRANSIENT_COOLDOWN_MS default (which then 503s every later request).
+  { status: 500, cooldownMs: COOLDOWN.short },
   { status: 401, cooldownMs: COOLDOWN.long },
   { status: 402, cooldownMs: COOLDOWN.long },
   { status: 403, cooldownMs: COOLDOWN.long },

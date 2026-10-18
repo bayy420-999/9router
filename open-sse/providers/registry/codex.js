@@ -40,6 +40,13 @@ export default {
     format: "openai-responses",
     forceStream: true,
     cliVersion: CODEX_CLI_VERSION,
+    // Codex 500s are transient upstream faults (edge/proxy), not request faults:
+    // DEFAULT_RETRY_CONFIG covers 429/502/503/504 only, so without this override a
+    // single upstream 500 surfaced straight to the client as JSON 500 before any
+    // SSE header. Shape matches the existing overrides (grok-cli.js / antigravity.js).
+    retry: {
+      500: { attempts: 2, delayMs: 2000 },
+    },
     headers: {
       originator: "codex_cli_rs",
       "User-Agent": `codex_cli_rs/${CODEX_CLI_VERSION}`,

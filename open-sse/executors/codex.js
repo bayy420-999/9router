@@ -9,7 +9,7 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
 import { getModelUpstreamId, getProviderModels } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
-import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
+import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry, STREAM_FIRST_CHUNK_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { dbg } from "../utils/debugLog.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
@@ -25,6 +25,19 @@ const CODEX_SSE_USER_OUTPUT_PATTERNS = [
 ];
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
+
+// Thrown when upstream accepts the request but sends no body bytes within
+// STREAM_FIRST_CHUNK_TIMEOUT_MS. Deliberately NOT named "AbortError": chatCore
+// maps AbortError to a client-side 499, while this is a retryable upstream
+// transport failure that must surface as 502 (see open-sse/handlers/chatCore.js).
+function codexPeekTimeoutError(timeoutMs) {
+  const err = new Error(`codex upstream sent no response body within ${timeoutMs}ms`);
+  err.name = "CodexPeekTimeoutError";
+  err.codexPeekTimeout = true;
+  err.timeoutMs = timeoutMs;
+  return err;
+}
+
 function isCodexResponsesLiteModel(model) {
   const baseId = String(model || "").replace(/\([^()]+\)\s*$/, "");
   return getProviderModels("cx").some((entry) => entry.id === baseId && entry.responsesLite === true);
@@ -292,10 +305,34 @@ export class CodexExecutor extends BaseExecutor {
     // Reuses 503 retry config — same semantic: upstream temporarily unavailable
     const retryConfig = { ...DEFAULT_RETRY_CONFIG, ...this.config.retry };
     const { attempts, delayMs } = resolveRetryEntry(retryConfig[503]);
+    // A silent upstream (no body bytes within STREAM_FIRST_CHUNK_TIMEOUT_MS) is a
+    // retryable transport failure, so it consumes the 502 retry budget. Without
+    // this the peek used to hang forever and the dead body was handed downstream
+    // as a truncated 200 stream ("upstream connection lost").
+    const {
+      attempts: peekTimeoutAttempts,
+      delayMs: peekTimeoutDelayMs,
+    } = resolveRetryEntry(retryConfig[HTTP_STATUS.BAD_GATEWAY]);
     let attempt = 0;
+    let peekTimeoutAttempt = 0;
     while (true) {
       const result = await super.execute(args);
-      const peek = await this._peekSseTransientError(result.response);
+      let peek;
+      try {
+        peek = await this._peekSseTransientError(result.response);
+      } catch (e) {
+        if (!e?.codexPeekTimeout && !e?.codexPeekAborted) throw e;
+        if (peekTimeoutAttempt >= peekTimeoutAttempts) {
+          args.log?.warn?.("RETRY", `CODEX | ${e.message} — retries exhausted (${peekTimeoutAttempt}/${peekTimeoutAttempts})`);
+          dbg("CODEX", `peek transport failure exhausted after ${peekTimeoutAttempt} retries → 502`);
+          throw e;
+        }
+        peekTimeoutAttempt++;
+        args.log?.debug?.("RETRY", `CODEX | ${e.message} retry ${peekTimeoutAttempt}/${peekTimeoutAttempts} after ${peekTimeoutDelayMs / 1000}s`);
+        dbg("CODEX", `peek transport failure → retry ${peekTimeoutAttempt}/${peekTimeoutAttempts} in ${peekTimeoutDelayMs}ms`);
+        await new Promise(r => setTimeout(r, peekTimeoutDelayMs));
+        continue;
+      }
       if (!peek.matched) {
         // Replace body with re-assembled stream (prefix bytes already read + rest)
         if (peek.replacementBody) {
@@ -327,6 +364,12 @@ export class CodexExecutor extends BaseExecutor {
   // Peek first N bytes of SSE body to detect upstream transient errors.
   // Returns { matched: string|null, message: string|null, accountFallback: boolean, replacementBody: ReadableStream|null }.
   // Caller must use replacementBody when no error matched (original body has been read).
+  // The whole peek is bounded by STREAM_FIRST_CHUNK_TIMEOUT_MS: upstream can accept
+  // the request (headers arrive) and then go silent during reasoning prefill, and
+  // nothing else covers that window — FETCH_CONNECT_TIMEOUT_MS is already cleared
+  // and the stall watchdog is only armed after this returns. On timeout the reader
+  // is cancelled and a CodexPeekTimeoutError is thrown so the caller retries /
+  // surfaces 502 instead of piping a dead body downstream.
   async _peekSseTransientError(response) {
     if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, replacementBody: null };
     const reader = response.body.getReader();
@@ -335,9 +378,25 @@ export class CodexExecutor extends BaseExecutor {
     let text = "";
     let matched = null;
     let accountFallback = false;
+    const peekTimeoutMs = STREAM_FIRST_CHUNK_TIMEOUT_MS;
+    let peekTimer = null;
+    let timedOut = false;
+    const deadline = new Promise((_, reject) => {
+      peekTimer = setTimeout(() => {
+        peekTimer = null;
+        timedOut = true;
+        reject(codexPeekTimeoutError(peekTimeoutMs));
+      }, peekTimeoutMs);
+      // Never hold the event loop open just for this deadline.
+      peekTimer.unref?.();
+    });
     try {
       while (text.length < CODEX_SSE_PEEK_BYTES) {
-        const { done, value } = await reader.read();
+        const readPromise = reader.read();
+        // Mark handled: when the deadline wins, this read settles later (cancel /
+        // socket close) and must not surface as an unhandled rejection.
+        readPromise.catch(() => {});
+        const { done, value } = await Promise.race([readPromise, deadline]);
         if (done) break;
         chunks.push(value);
         text += decoder.decode(value, { stream: true });
@@ -349,7 +408,23 @@ export class CodexExecutor extends BaseExecutor {
         if (CODEX_SSE_USER_OUTPUT_PATTERNS.some(p => lowerText.includes(p))) break;
       }
     } catch (e) {
-      dbg("CODEX", `peek read error: ${e.message}`);
+      // Release the socket on every abnormal exit; nothing has been sent
+      // downstream yet, so surfacing the failure is always better than piping a
+      // dead body as a truncated 200 (the "upstream connection lost" symptom).
+      try { await reader.cancel(e); } catch { /* noop */ }
+      try { reader.releaseLock(); } catch { /* noop */ }
+      if (timedOut || e?.codexPeekTimeout) throw e?.codexPeekTimeout ? e : codexPeekTimeoutError(peekTimeoutMs);
+      // Client aborted / stream torn down by the caller: keep AbortError semantics
+      // (chatCore maps it to 499 and must not retry).
+      if (e?.name === "AbortError") throw e;
+      dbg("CODEX", `peek read error: ${e?.message || e}`);
+      const transport = new Error(`codex upstream body read failed: ${e?.message || e}`);
+      transport.name = "CodexPeekError";
+      transport.codexPeekAborted = true;
+      transport.cause = e;
+      throw transport;
+    } finally {
+      if (peekTimer) { clearTimeout(peekTimer); peekTimer = null; }
     }
 
     if (matched) {
@@ -412,8 +487,13 @@ export class CodexExecutor extends BaseExecutor {
    * Image fetching is handled separately in prefetchImages() so this stays sync.
    */
   transformRequest(model, body, stream, credentials) {
+    // Internal routing markers must survive re-entry: base.js re-runs
+    // transformRequest on the SAME body object for each retry (tryRetry →
+    // `urlIndex--; continue`), so deleting them here made the 2nd/3rd attempt
+    // take a different route (/responses instead of /responses/compact, no
+    // web_search re-registration). The final RESPONSES_API_ALLOWLIST pass strips
+    // them before the body is serialized, so keeping them costs nothing.
     this._isCompact = !!body._compact;
-    delete body._compact;
     // Resolve conversation-stable session_id (priority: body → assistant-text → workspace → machine)
     this._currentSessionId = resolveCacheSessionId(body, credentials);
     // Convert string input to array format (Codex API requires input as array)
@@ -422,7 +502,6 @@ export class CodexExecutor extends BaseExecutor {
     const upstreamModel = getModelUpstreamId("cx", body.model || model);
     // Register hosted search before choosing transport; Lite cannot execute it.
     const autoWebSearch = body._autoCodexWebSearch === true;
-    delete body._autoCodexWebSearch;
     if (autoWebSearch && !body.tools?.some?.(tool => tool?.type === "web_search")) {
       body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: "web_search" }];
     }

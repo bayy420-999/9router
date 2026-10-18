@@ -5,6 +5,7 @@ import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBu
 import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
+import { restoreToolNames } from "./opencodeFingerprint.js";
 
 import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
 
@@ -172,6 +173,19 @@ export function createSSEStream(options = {}) {
 
               // Ensure OpenAI-required fields are present on streaming chunks (Letta compat)
               let fieldsInjected = false;
+
+              // Same-format passthrough never runs translateResponse(), so tool names
+              // aliased for the upstream (opencode fingerprint / Claude cloaking) would
+              // leak to the client as unknown tools ("No tool named shell_client...").
+              // Restore them here, before any of the serialization branches below.
+              if (toolNameMap?.size) {
+                const restored = restoreToolNames(parsed, toolNameMap);
+                if (restored !== parsed) {
+                  Object.assign(parsed, restored);
+                  fieldsInjected = true;
+                }
+              }
+
               if (parsed.choices !== undefined) {
                 if (!parsed.object) { parsed.object = "chat.completion.chunk"; fieldsInjected = true; }
                 if (!parsed.created) { parsed.created = Math.floor(Date.now() / 1000); fieldsInjected = true; }
@@ -435,6 +449,17 @@ export function createSSEStream(options = {}) {
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
               output = "data: " + buffer.slice(5);
             }
+            // A trailing partial line can still carry a name aliased for the
+            // upstream — restore it before it goes out raw (see transform()).
+            if (toolNameMap?.size && output.startsWith("data:") && output.slice(5).trim() !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(output.slice(5).trim());
+                const restored = restoreToolNames(parsed, toolNameMap);
+                if (restored !== parsed) output = `data: ${JSON.stringify(restored)}`;
+              } catch {
+                // Non-JSON tail chunk — forward untouched.
+              }
+            }
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
           }
@@ -553,7 +578,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
     provider,
@@ -562,6 +587,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
     connectionId,
     body,
     onStreamComplete,
-    apiKey
+    apiKey,
+    toolNameMap
   });
 }

@@ -1,4 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { DefaultExecutor } from "./default.js";
+
+const PROTECTED_HEADER_NAMES = new Set([
+  "x-conversation-id",
+  "x-conversation-request-id",
+  "x-conversation-message-id",
+]);
 
 /**
  * CodeBuddyIntlExecutor — talks to https://www.codebuddy.ai/v2/chat/completions
@@ -11,6 +18,41 @@ import { DefaultExecutor } from "./default.js";
 export class CodeBuddyIntlExecutor extends DefaultExecutor {
   constructor() {
     super("codebuddy-intl");
+  }
+
+  buildHeaders(credentials, stream = true, url, model, body = null) {
+    const headers = super.buildHeaders(credentials, stream, url, model, body);
+
+    const convId = randomUUID();
+    let reqId = randomUUID();
+    while (reqId === convId) reqId = randomUUID();
+    let msgId = randomUUID();
+    while (msgId === convId || msgId === reqId) msgId = randomUUID();
+
+    headers["X-Conversation-ID"] = convId;
+    headers["X-Conversation-Request-ID"] = reqId;
+    headers["X-Conversation-Message-ID"] = msgId;
+
+    return new Proxy(headers, {
+      set(target, prop, value, receiver) {
+        if (typeof prop === "string" && PROTECTED_HEADER_NAMES.has(prop.toLowerCase())) {
+          return true;
+        }
+        return Reflect.set(target, prop, value, receiver);
+      },
+      defineProperty(target, prop, descriptor) {
+        if (typeof prop === "string" && PROTECTED_HEADER_NAMES.has(prop.toLowerCase())) {
+          return true;
+        }
+        return Reflect.defineProperty(target, prop, descriptor);
+      },
+      deleteProperty(target, prop) {
+        if (typeof prop === "string" && PROTECTED_HEADER_NAMES.has(prop.toLowerCase())) {
+          return true;
+        }
+        return Reflect.deleteProperty(target, prop);
+      },
+    });
   }
 
   transformRequest(model, body, stream, credentials) {
